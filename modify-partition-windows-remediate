@@ -1,0 +1,102 @@
+description: '## Modify Partition Windows'
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::079697969914:role/AmazonSSMRoleForAutomationAssumeQuickSetup'
+outputs:
+- getInstanceDetails.Instance
+parameters:
+  InstanceId:
+    type: String
+    description: (Required) ID of your EC2 Windows managed instance.
+mainSteps:
+  - name: getInstanceDetails
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+    outputs:
+    - Name: availabilityZone
+      Selector: "$.Reservations[0].Instances[0].Placement.AvailabilityZone"
+      Type: String
+    - Name: rootDeviceName
+      Selector: "$.Reservations[0].Instances[0].RootDeviceName"
+      Type: String
+    - Name: Instance
+      Selector: "$.Reservations[0].Instances[0].InstanceId"
+      Type: String
+  - name: waitForSSMAgentOnline
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 30
+    onFailure: step:rebootToMakeItReady
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+      - key: InstanceIds
+        valueSet:
+        - "{{ getInstanceDetails.Instance }}"
+      PropertySelector: "$.InstanceInformationList[0].PingStatus"
+      DesiredValues:
+      - Online
+    isCritical: 'true'
+    nextStep: expandpartition
+  - name: rebootToMakeItReady
+    action: aws:executeAwsApi
+    onFailure: step:waitForInstanceToBeReadyAfterReboot
+    inputs:
+      Service: ec2
+      Api: RebootInstances
+      InstanceIds:
+      - "{{ getInstanceDetails.Instance }}"
+    isCritical: 'false'
+  - name: waitForInstanceToBeReadyAfterReboot
+    action: aws:waitForAwsResourceProperty
+    timeoutSeconds: 600
+    maxAttempts: 2
+    inputs:
+      Service: ec2
+      Api: DescribeInstanceStatus
+      InstanceIds:
+      - "{{ getInstanceDetails.Instance }}"
+      PropertySelector: "$.InstanceStatuses[0].InstanceStatus.Details[0].Status"
+      DesiredValues:
+      - passed
+    isCritical: 'true'
+    nextStep: expandpartition
+  - name: expandpartition
+    action: 'aws:runCommand'
+    maxAttempts: 2
+    onFailure: Abort
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds: 
+        - '{{ getInstanceDetails.Instance }}'
+      Parameters:
+        commands:
+          - "$Commands = @("
+          - "    '$DiskNumber = (Get-Partition -DriveLetter C).DiskNumber',"
+          - "    'Update-Disk -Number \"$DiskNumber\"',"
+          - "    '$Size = Get-PartitionSupportedSize -DriveLetter C',"
+          - "    'Resize-Partition -DriveLetter C -Size $Size.SizeMax'"
+          - ")"
+          - "$Parameter = @{"
+          - "    commands = $Commands"
+          - "}"
+          - "$Document = 'AWS-RunPowerShellScript'"
+          - ""
+          - "Try {"
+          - "    $Cmd = Send-SSMCommand -DocumentName $Document -Parameter $Parameter -InstanceId {{ getInstanceDetails.Instance }} -Region 'us-east-1'"
+          - "    While ($Cmd.Status -ne 'Success') {"
+          - "        $Cmd = Get-SSMCommand -CommandId $Cmd.CommandId"
+          - "        Start-Sleep 20"
+          - "    }"
+          - "    Write-Host \"C drive is extended\" -ForegroundColor Green"
+          - "}"
+          - "Catch {"
+          - "    Write-Host \"\""
+          - "    Write-Host \"Failed to extend drive\" -ForegroundColor Red"
+          - "}"
+    isCritical: 'true'
+    isEnd: 'true'
